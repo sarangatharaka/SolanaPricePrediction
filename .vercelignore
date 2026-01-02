@@ -1,0 +1,66 @@
+# Git and version control
+.git
+.gitignore
+.github
+
+# Python virtual environments
+.venv
+venv
+env
+ENV
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+build
+dist
+
+# Large files and models
+*.pkl
+*.h5
+*.joblib
+model_weights
+data
+*.csv
+
+# IDE and editors
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+node_modules
+
+# Streamlit
+.streamlit
+
+# Documentation
+PHASE1_SUMMARY.md
+VERCEL_DEPLOYMENT_GUIDE.md
+VERCEL_README.md
+Project Status.docx
+*.png
+
+# Test files
+test_*.py
+*_test.py
+
+# Testing
+
+.pytest_cache
+.coverage
+
+# Other
+
+.env.local
+Project Status.docx
+PHASE1_SUMMARY.md
+VERCEL_DEPLOYMENT_GUIDE.md
+VERCEL_README.md
