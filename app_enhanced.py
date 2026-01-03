@@ -980,23 +980,6 @@ with tab5:
                 st.info("Unable to generate trading signal. Insufficient data.")
     except Exception as e:
         st.error(f"Error generating trading signals: {e}")
-                window = min(60, len(binance_df))
-                df_plot = binance_df.tail(window)
-                fig_sig = go.Figure()
-                fig_sig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['close'], mode='lines', name='Close'))
-                fig_sig.add_hline(y=signal['take_profit'], line_dash="dash", line_color="green", annotation_text="TP")
-                fig_sig.add_hline(y=signal['stop_loss'], line_dash="dash", line_color="red", annotation_text="SL")
-                fig_sig.update_layout(title="4h Price with TP/SL", xaxis_title="Time", yaxis_title="Price ($)", height=400)
-                apply_dark_theme(fig_sig)
-                st.plotly_chart(fig_sig, use_container_width=True, theme=None)
-
-                # Recent candles table
-                display_cols = ['start_time', 'open', 'high', 'low', 'close', 'volume']
-                st.dataframe(binance_df.tail(15)[display_cols].rename(columns=str.capitalize), use_container_width=True)
-            else:
-                st.info("Not enough data to generate a signal yet.")
-    except Exception as e:
-        st.error(f"Binance fetch error: {e}")
 
 # Prepare data for training
 with tab2:
