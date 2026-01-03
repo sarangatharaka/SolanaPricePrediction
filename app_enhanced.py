@@ -469,79 +469,106 @@ if st.sidebar.button("🗑️ Clear Model Cache"):
 st.title("💹Solana Price Prediction")
 st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 
-# Download data without caching (use CoinGecko as primary - not geo-blocked)
+# Download data with caching to reduce API calls
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def download_data(symbol, start, end):
-    """Download price history from CoinGecko (free tier, not geo-blocked)."""
+    """Download price history from CoinGecko (not geo-blocked, with retry logic)."""
     import sys
+    import time
     min_days = SEQUENCE_LENGTH + 1
 
-    def _pull_coingecko_historical(coin_id="solana", days=365):
-        """Pull historical data from CoinGecko API (free tier: max 365 days)."""
-        try:
-            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-            params = {
-                "vs_currency": "usd",
-                "days": min(days, 365),  # Free tier limited to 365 days
-                "interval": "daily"
-            }
-            print(f"[DEBUG] Requesting CoinGecko: {url} with params {params}", file=sys.stderr)
-            resp = requests.get(url, params=params, timeout=20)
-            print(f"[DEBUG] Response status: {resp.status_code}", file=sys.stderr)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            prices = data.get("prices", [])
-            print(f"[DEBUG] Got {len(prices)} price points from CoinGecko", file=sys.stderr)
-            
-            if not prices:
-                print(f"[DEBUG] Empty prices response", file=sys.stderr)
-                return pd.DataFrame()
-            
-            # Convert to DataFrame
-            df_list = []
-            for timestamp_ms, price in prices:
-                timestamp = pd.to_datetime(timestamp_ms, unit='ms')
-                df_list.append({
-                    'timestamp': timestamp,
-                    'Close': price,
-                    'Open': price,
-                    'High': price,
-                    'Low': price,
-                    'Adj Close': price,
-                    'Volume': 0  # CoinGecko free tier doesn't provide volume
+    def _pull_coingecko_historical(coin_id="solana", days=365, max_retries=5):
+        """Pull historical data from CoinGecko API with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+                params = {
+                    "vs_currency": "usd",
+                    "days": min(days, 365),  # Free tier limited to 365 days
+                    "interval": "daily"
+                }
+                print(f"[DEBUG] Attempt {attempt + 1}/{max_retries}: Requesting CoinGecko {url}", file=sys.stderr)
+                resp = requests.get(url, params=params, timeout=20)
+                print(f"[DEBUG] Response status: {resp.status_code}", file=sys.stderr)
+                
+                # Handle rate limiting
+                if resp.status_code == 429:
+                    wait_time = min(2 ** attempt, 60)  # Exponential backoff: 1, 2, 4, 8, 16, 32, 60 seconds
+                    print(f"[DEBUG] Rate limited (429). Waiting {wait_time}s before retry...", file=sys.stderr)
+                    time.sleep(wait_time)
+                    continue
+                
+                resp.raise_for_status()
+                data = resp.json()
+                
+                prices = data.get("prices", [])
+                print(f"[DEBUG] Got {len(prices)} price points from CoinGecko", file=sys.stderr)
+                
+                if not prices:
+                    print(f"[DEBUG] Empty prices response", file=sys.stderr)
+                    return pd.DataFrame()
+                
+                # Convert to DataFrame
+                df_list = []
+                for timestamp_ms, price in prices:
+                    timestamp = pd.to_datetime(timestamp_ms, unit='ms')
+                    df_list.append({
+                        'timestamp': timestamp,
+                        'Close': price,
+                        'Open': price,
+                        'High': price,
+                        'Low': price,
+                        'Adj Close': price,
+                        'Volume': 0
+                    })
+                
+                df = pd.DataFrame(df_list)
+                df['date'] = df['timestamp'].dt.date
+                df_grouped = df.groupby('date').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Adj Close': 'last',
+                    'Volume': 'sum'
                 })
-            
-            df = pd.DataFrame(df_list)
-            df['date'] = df['timestamp'].dt.date
-            # Group by date to ensure one row per day
-            df_grouped = df.groupby('date').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Adj Close': 'last',
-                'Volume': 'sum'
-            })
-            df_grouped.index = pd.to_datetime(df_grouped.index)
-            
-            print(f"[DEBUG] Processed to {len(df_grouped)} daily rows", file=sys.stderr)
-            return df_grouped.sort_index()
-        except Exception as e:
-            print(f"[DEBUG] Error in _pull_coingecko_historical: {type(e).__name__}: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            return pd.DataFrame()
+                df_grouped.index = pd.to_datetime(df_grouped.index)
+                
+                print(f"[DEBUG] Successfully fetched {len(df_grouped)} daily rows", file=sys.stderr)
+                return df_grouped.sort_index()
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    wait_time = min(2 ** attempt, 60)
+                    print(f"[DEBUG] Rate limited (429). Waiting {wait_time}s before retry...", file=sys.stderr)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[DEBUG] HTTP error: {e}", file=sys.stderr)
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise
+            except Exception as e:
+                print(f"[DEBUG] Error on attempt {attempt + 1}: {type(e).__name__}: {e}", file=sys.stderr)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return pd.DataFrame()
+        
+        return pd.DataFrame()
 
-    # PRIMARY: CoinGecko - get 365 days of history (free tier limit)
-    print(f"[DEBUG] Attempting to fetch from CoinGecko (365 days)", file=sys.stderr)
-    data_cg = _pull_coingecko_historical(coin_id="solana", days=365)
+    # Try to fetch from CoinGecko with retries
+    print(f"[DEBUG] Starting data fetch from CoinGecko", file=sys.stderr)
+    data_cg = _pull_coingecko_historical(coin_id="solana", days=365, max_retries=5)
     print(f"[DEBUG] CoinGecko result: {len(data_cg)} rows", file=sys.stderr)
+    
     if len(data_cg) >= min_days:
-        print(f"[DEBUG] Using CoinGecko data ({len(data_cg)} days)", file=sys.stderr)
+        print(f"[DEBUG] Successfully fetched {len(data_cg)} days of data", file=sys.stderr)
         return data_cg
 
     print(f"[DEBUG] Insufficient data ({len(data_cg)} < {min_days}), raising error", file=sys.stderr)
-    raise ValueError(f"Unable to fetch sufficient data. Got {len(data_cg)} rows, need at least {min_days}. Please try again.")
+    raise ValueError(f"Unable to fetch sufficient data from CoinGecko. Got {len(data_cg)} rows, need at least {min_days}. Please try again in a moment.")
 
 # Get real-time current price (not cached) - use CoinGecko
 def get_realtime_price(symbol):
