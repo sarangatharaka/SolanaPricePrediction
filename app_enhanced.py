@@ -294,27 +294,93 @@ def fetch_latest_news(feeds=None, per_feed_limit: int = 5, total_limit: int = 15
     collected.sort(key=lambda x: x["published"] or datetime.datetime.min, reverse=True)
     return collected[:total_limit]
 
-# Binance data utilities
+# CoinGecko data utilities (geo-accessible, no 451 errors)
 @st.cache_data(ttl=300)
+def fetch_coingecko_recent_data(coin_id: str = "solana", days: int = 30):
+    """Fetch recent price data from CoinGecko (can aggregate to 4h candles)."""
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        params = {
+            "vs_currency": "usd",
+            "days": days,
+            "interval": "daily"
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        prices = data.get("prices", [])
+        if not prices:
+            return pd.DataFrame()
+        
+        # Convert to DataFrame with OHLC structure
+        df_list = []
+        for i, (timestamp_ms, price) in enumerate(prices):
+            timestamp = pd.to_datetime(timestamp_ms, unit='ms', utc=True)
+            df_list.append({
+                'close_time': timestamp,
+                'open': price,
+                'high': price,
+                'low': price,
+                'close': price,
+                'volume': 0
+            })
+        
+        df = pd.DataFrame(df_list)
+        df.set_index('close_time', inplace=True)
+        
+        return df.sort_index()
+    except Exception as e:
+        st.warning(f"CoinGecko fetch error: {e}")
+        return pd.DataFrame()
+
 def fetch_binance_klines(symbol: str, interval: str = BINANCE_INTERVAL, limit: int = 300):
-    """Fetch klines from Binance; ttl keeps requests light."""
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    klines = resp.json()
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume", "close_time",
-        "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
-    ]
-    df = pd.DataFrame(klines, columns=cols)
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
-    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    df.set_index('close_time', inplace=True)
-    df.rename(columns={'open_time': 'start_time'}, inplace=True)
-    return df
+    """Fallback to fetch klines from Binance with error handling - use CoinGecko instead."""
+    # Prefer CoinGecko to avoid 451 geo-blocking errors
+    try:
+        df = fetch_coingecko_recent_data(coin_id="solana", days=30)
+        if not df.empty and len(df) >= 10:
+            # Rename columns to match Binance format
+            df.rename(columns={
+                'open': 'open',
+                'high': 'high', 
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume'
+            }, inplace=True)
+            return df
+    except Exception:
+        pass
+    
+    # If CoinGecko fails, try Binance with retry logic
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        resp = requests.get(url, params=params, timeout=10)
+        
+        if resp.status_code == 451:
+            # Geo-blocked, use CoinGecko fallback
+            st.warning("Binance API blocked in your region. Using CoinGecko data instead.")
+            return fetch_coingecko_recent_data(coin_id="solana", days=30)
+        
+        resp.raise_for_status()
+        klines = resp.json()
+        cols = [
+            "open_time", "open", "high", "low", "close", "volume", "close_time",
+            "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
+        ]
+        df = pd.DataFrame(klines, columns=cols)
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+        df.set_index('close_time', inplace=True)
+        df.rename(columns={'open_time': 'start_time'}, inplace=True)
+        return df
+    except Exception as e:
+        st.warning(f"Could not fetch 4h data: {e}")
+        # Return empty dataframe - will be handled gracefully
+        return pd.DataFrame()
 
 def compute_atr(df: pd.DataFrame, period: int = 14):
     """Compute a lightweight ATR-like volatility measure."""
@@ -850,16 +916,16 @@ with tab4:
         st.info("Enable 'Use Technical Indicators' in the sidebar to see technical analysis.")
 
 with tab5:
-    st.subheader("⚡ Real-Time Trading Signals (4h)")
+    st.subheader("⚡ Real-Time Trading Signals")
     try:
-        with st.spinner("Fetching 4h data from Binance..."):
+        with st.spinner("Fetching price data..."):
             binance_df = fetch_binance_klines(BINANCE_SYMBOL, BINANCE_INTERVAL)
         if binance_df.empty:
-            st.warning("No Binance data returned.")
+            st.info("⏳ Trading signal data temporarily unavailable. Please refresh the page in a moment.")
         else:
             latest_row = binance_df.iloc[-1]
             latest_price = float(latest_row['close'])
-            st.metric("Live Price", f"${latest_price:.2f}", help="From Binance 4h close")
+            st.metric("Latest Price", f"${latest_price:.2f}")
             signal = generate_trading_signal(binance_df, tp_pct=tp_pct, sl_pct=sl_pct)
             if signal:
                 cols = st.columns(3)
@@ -875,9 +941,45 @@ with tab5:
                 cols2[2].metric("Risk/Reward", rr_text)
                 cols2[3].metric("RSI", f"{signal['rsi']:.1f}")
 
-                st.caption(f"Timeframe: {signal['timeframe']} | Generated at: {signal['generated_at']}")
+                st.caption(f"Timeframe: Daily | Generated at: {signal['generated_at']}")
 
                 # Chart with TP/SL overlays (last 60 candles)
+                if len(binance_df) > 0:
+                    chart_data = binance_df.tail(60).copy()
+                    fig_signal = go.Figure()
+                    
+                    fig_signal.add_trace(go.Scatter(
+                        x=chart_data.index.astype(str),
+                        y=chart_data['close'].values,
+                        mode='lines',
+                        name='Price',
+                        line=dict(color='#00ff00', width=2)
+                    ))
+                    
+                    if signal['action'] == "Buy":
+                        fig_signal.add_hline(y=signal['take_profit'], line_dash="dash", line_color="green", 
+                                           annotation_text="TP", annotation_position="right")
+                        fig_signal.add_hline(y=signal['stop_loss'], line_dash="dash", line_color="red",
+                                           annotation_text="SL", annotation_position="right")
+                    elif signal['action'] == "Sell":
+                        fig_signal.add_hline(y=signal['stop_loss'], line_dash="dash", line_color="red",
+                                           annotation_text="SL", annotation_position="right")
+                        fig_signal.add_hline(y=signal['take_profit'], line_dash="dash", line_color="green",
+                                           annotation_text="TP", annotation_position="right")
+                    
+                    fig_signal.update_layout(
+                        title='Trading Signal Chart (Last 60 Candles)',
+                        xaxis_title='Time',
+                        yaxis_title='Price ($)',
+                        height=500,
+                        showlegend=True
+                    )
+                    apply_dark_theme(fig_signal)
+                    st.plotly_chart(fig_signal, use_container_width=True, theme=None)
+            else:
+                st.info("Unable to generate trading signal. Insufficient data.")
+    except Exception as e:
+        st.error(f"Error generating trading signals: {e}")
                 window = min(60, len(binance_df))
                 df_plot = binance_df.tail(window)
                 fig_sig = go.Figure()
