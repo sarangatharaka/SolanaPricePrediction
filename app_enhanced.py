@@ -472,39 +472,95 @@ st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 # Cache the data download
 @st.cache_data
 def download_data(symbol, start, end, min_days: int = SEQUENCE_LENGTH + 1):
-    """Download price history with fallbacks so short ranges don't break the app."""
-    end_extended = end + datetime.timedelta(days=1)  # grab the latest candle
+    """Download price history with multiple fallbacks (Yahoo then Binance) to avoid empty datasets."""
 
-    def _pull(symbol_value, start_value, end_value, **kwargs):
+    def _trim_to_range(df: pd.DataFrame):
+        if df.empty:
+            return df
+        idx = df.index.tz_localize(None) if getattr(df.index, "tz", None) else df.index
+        return df.loc[(idx.date >= start) & (idx.date <= end)]
+
+    def _pull_yf(symbol_value, start_value, end_value, **kwargs):
         try:
             df = yf.download(symbol_value, start=start_value, end=end_value, progress=False, **kwargs)
             return df if df is not None else pd.DataFrame()
         except Exception:
             return pd.DataFrame()
 
-    data = _pull(symbol, start, end_extended)
-    data = data.sort_index()
+    def _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200, start_value=None, end_value=None):
+        try:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {"symbol": symbol_value, "interval": interval, "limit": limit}
+            if start_value:
+                params["startTime"] = int(datetime.datetime.combine(start_value, datetime.time.min).timestamp() * 1000)
+            if end_value:
+                params["endTime"] = int(datetime.datetime.combine(end_value, datetime.time.max).timestamp() * 1000)
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            klines = resp.json()
+            cols = [
+                "open_time", "open", "high", "low", "close", "volume", "close_time",
+                "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
+            ]
+            df = pd.DataFrame(klines, columns=cols)
+            if df.empty:
+                return df
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            df = df.set_index("close_time")
+            df.rename(columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume"
+            }, inplace=True)
+            # Binance has no Adj Close; use Close
+            df["Adj Close"] = df["Close"]
+            return df
+        except Exception:
+            return pd.DataFrame()
 
+    end_extended = end + datetime.timedelta(days=1)  # grab the latest candle
+
+    # 1) User-selected window
+    data = _pull_yf(symbol, start, end_extended).sort_index()
     if len(data) >= min_days:
-        return data
+        return _trim_to_range(data)
 
-    # Fallback 1: widen the window automatically to at least cover the minimum days
+    # 2) Widened window on Yahoo
     widened_start = max(start - datetime.timedelta(days=max(min_days * 2, 120)), datetime.date(2018, 1, 1))
-    data_wide = _pull(symbol, widened_start, end_extended)
-    data_wide = data_wide.sort_index()
+    data_wide = _pull_yf(symbol, widened_start, end_extended).sort_index()
     if len(data_wide) >= min_days:
-        return data_wide
+        return _trim_to_range(data_wide)
 
-    # Fallback 2: ask yfinance for the maximum available history
-    try:
-        data_max = yf.download(symbol, period="max", progress=False)
-        data_max = data_max.sort_index()
-        if len(data_max) >= min_days:
-            return data_max
-    except Exception:
-        pass
+    # 3) Max history on Yahoo
+    data_max = _pull_yf(symbol, None, None, period="max").sort_index()
+    if len(data_max) >= min_days:
+        return _trim_to_range(data_max)
 
-    raise ValueError(f"Insufficient data returned for {symbol} (got {len(data)} rows). Try expanding the date range or retry later.")
+    # 4) Binance daily candles fallback (SOLUSDT)
+    data_binance = _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200, start_value=start, end_value=end)
+    if len(data_binance) >= min_days:
+        return _trim_to_range(data_binance)
+
+    # 5) Binance 4h candles aggregated to daily as last resort
+    data_binance_4h = _pull_binance(symbol_value="SOLUSDT", interval="4h", limit=1500, start_value=start, end_value=end)
+    if not data_binance_4h.empty:
+        daily = data_binance_4h.resample("1D").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Adj Close": "last",
+            "Volume": "sum"
+        }).dropna()
+        if len(daily) >= min_days:
+            return _trim_to_range(daily)
+
+    raise ValueError(f"Insufficient data returned for {symbol} (got 0 rows across all sources). Try expanding the date range or retry later.")
 
 # Get real-time current price (not cached)
 def get_realtime_price(symbol):
