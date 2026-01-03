@@ -471,11 +471,40 @@ st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 
 # Cache the data download
 @st.cache_data
-def download_data(symbol, start, end):
-    # Add 1 day to end date to ensure we get the latest available data
-    end_extended = end + datetime.timedelta(days=1)
-    data = yf.download(symbol, start=start, end=end_extended, progress=False)
-    return data
+def download_data(symbol, start, end, min_days: int = SEQUENCE_LENGTH + 1):
+    """Download price history with fallbacks so short ranges don't break the app."""
+    end_extended = end + datetime.timedelta(days=1)  # grab the latest candle
+
+    def _pull(symbol_value, start_value, end_value, **kwargs):
+        try:
+            df = yf.download(symbol_value, start=start_value, end=end_value, progress=False, **kwargs)
+            return df if df is not None else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    data = _pull(symbol, start, end_extended)
+    data = data.sort_index()
+
+    if len(data) >= min_days:
+        return data
+
+    # Fallback 1: widen the window automatically to at least cover the minimum days
+    widened_start = max(start - datetime.timedelta(days=max(min_days * 2, 120)), datetime.date(2018, 1, 1))
+    data_wide = _pull(symbol, widened_start, end_extended)
+    data_wide = data_wide.sort_index()
+    if len(data_wide) >= min_days:
+        return data_wide
+
+    # Fallback 2: ask yfinance for the maximum available history
+    try:
+        data_max = yf.download(symbol, period="max", progress=False)
+        data_max = data_max.sort_index()
+        if len(data_max) >= min_days:
+            return data_max
+    except Exception:
+        pass
+
+    raise ValueError(f"Insufficient data returned for {symbol} (got {len(data)} rows). Try expanding the date range or retry later.")
 
 # Get real-time current price (not cached)
 def get_realtime_price(symbol):
