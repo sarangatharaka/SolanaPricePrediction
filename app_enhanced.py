@@ -469,123 +469,95 @@ if st.sidebar.button("🗑️ Clear Model Cache"):
 st.title("💹Solana Price Prediction")
 st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 
-# Download data without caching (use Binance as primary, avoid Yahoo Finance blocking)
+# Download data without caching (use CoinGecko as primary - not geo-blocked)
 def download_data(symbol, start, end):
-    """Download price history from Binance with fallbacks."""
+    """Download price history from CoinGecko (free tier, not geo-blocked)."""
     import sys
     min_days = SEQUENCE_LENGTH + 1
 
-    def _pull_binance_simple(symbol_value="SOLUSDT", interval="1d", limit=1000):
-        """Simple pull from Binance API - single request, no pagination."""
+    def _pull_coingecko_historical(coin_id="solana", days=365):
+        """Pull historical data from CoinGecko API (free tier: max 365 days)."""
         try:
-            url = "https://api.binance.com/api/v3/klines"
+            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
             params = {
-                "symbol": symbol_value,
-                "interval": interval,
-                "limit": limit
+                "vs_currency": "usd",
+                "days": min(days, 365),  # Free tier limited to 365 days
+                "interval": "daily"
             }
-            print(f"[DEBUG] Requesting {url} with params {params}", file=sys.stderr)
+            print(f"[DEBUG] Requesting CoinGecko: {url} with params {params}", file=sys.stderr)
             resp = requests.get(url, params=params, timeout=20)
             print(f"[DEBUG] Response status: {resp.status_code}", file=sys.stderr)
             resp.raise_for_status()
-            klines = resp.json()
-            print(f"[DEBUG] Got {len(klines)} klines", file=sys.stderr)
+            data = resp.json()
             
-            if not klines or len(klines) == 0:
-                print(f"[DEBUG] Empty klines response", file=sys.stderr)
+            prices = data.get("prices", [])
+            print(f"[DEBUG] Got {len(prices)} price points from CoinGecko", file=sys.stderr)
+            
+            if not prices:
+                print(f"[DEBUG] Empty prices response", file=sys.stderr)
                 return pd.DataFrame()
             
-            cols = [
-                "open_time", "open", "high", "low", "close", "volume", "close_time",
-                "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
-            ]
-            df = pd.DataFrame(klines, columns=cols)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.set_index("close_time").sort_index()
-            df.rename(columns={
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume"
-            }, inplace=True)
-            df["Adj Close"] = df["Close"]
-            result = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna()
-            print(f"[DEBUG] Returning {len(result)} rows", file=sys.stderr)
-            return result
+            # Convert to DataFrame
+            df_list = []
+            for timestamp_ms, price in prices:
+                timestamp = pd.to_datetime(timestamp_ms, unit='ms')
+                df_list.append({
+                    'timestamp': timestamp,
+                    'Close': price,
+                    'Open': price,
+                    'High': price,
+                    'Low': price,
+                    'Adj Close': price,
+                    'Volume': 0  # CoinGecko free tier doesn't provide volume
+                })
+            
+            df = pd.DataFrame(df_list)
+            df['date'] = df['timestamp'].dt.date
+            # Group by date to ensure one row per day
+            df_grouped = df.groupby('date').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Adj Close': 'last',
+                'Volume': 'sum'
+            })
+            df_grouped.index = pd.to_datetime(df_grouped.index)
+            
+            print(f"[DEBUG] Processed to {len(df_grouped)} daily rows", file=sys.stderr)
+            return df_grouped.sort_index()
         except Exception as e:
-            print(f"[DEBUG] Error in _pull_binance_simple: {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"[DEBUG] Error in _pull_coingecko_historical: {type(e).__name__}: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc(file=sys.stderr)
             return pd.DataFrame()
 
-    # PRIMARY: Binance daily candles (SOLUSDT) - 1000 candles = ~3 years
-    print(f"[DEBUG] Attempting to fetch daily klines", file=sys.stderr)
-    data_binance_daily = _pull_binance_simple(symbol_value="SOLUSDT", interval="1d", limit=1000)
-    print(f"[DEBUG] Daily klines result: {len(data_binance_daily)} rows", file=sys.stderr)
-    if len(data_binance_daily) >= min_days:
-        print(f"[DEBUG] Using daily klines", file=sys.stderr)
-        return data_binance_daily
+    # PRIMARY: CoinGecko - get 365 days of history (free tier limit)
+    print(f"[DEBUG] Attempting to fetch from CoinGecko (365 days)", file=sys.stderr)
+    data_cg = _pull_coingecko_historical(coin_id="solana", days=365)
+    print(f"[DEBUG] CoinGecko result: {len(data_cg)} rows", file=sys.stderr)
+    if len(data_cg) >= min_days:
+        print(f"[DEBUG] Using CoinGecko data ({len(data_cg)} days)", file=sys.stderr)
+        return data_cg
 
-    # FALLBACK: Binance 4h candles (1000 candles = ~166 days) - aggregate to daily
-    print(f"[DEBUG] Attempting to fetch 4h klines", file=sys.stderr)
-    try:
-        data_binance_4h = _pull_binance_simple(symbol_value="SOLUSDT", interval="4h", limit=1000)
-        print(f"[DEBUG] 4h klines result: {len(data_binance_4h)} rows", file=sys.stderr)
-        if not data_binance_4h.empty and len(data_binance_4h) >= min_days:
-            daily = data_binance_4h.resample("1D").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Adj Close": "last",
-                "Volume": "sum"
-            }).dropna()
-            print(f"[DEBUG] Aggregated to {len(daily)} daily rows", file=sys.stderr)
-            if len(daily) >= min_days:
-                print(f"[DEBUG] Using 4h aggregated klines", file=sys.stderr)
-                return daily
-    except Exception as e:
-        print(f"[DEBUG] Error with 4h klines: {e}", file=sys.stderr)
+    print(f"[DEBUG] Insufficient data ({len(data_cg)} < {min_days}), raising error", file=sys.stderr)
+    raise ValueError(f"Unable to fetch sufficient data. Got {len(data_cg)} rows, need at least {min_days}. Please try again.")
 
-    # LAST RESORT: Use 1h candles (1000 candles = ~41 days) aggregated to daily
-    print(f"[DEBUG] Attempting to fetch 1h klines", file=sys.stderr)
-    try:
-        data_binance_1h = _pull_binance_simple(symbol_value="SOLUSDT", interval="1h", limit=1000)
-        print(f"[DEBUG] 1h klines result: {len(data_binance_1h)} rows", file=sys.stderr)
-        if not data_binance_1h.empty and len(data_binance_1h) >= min_days:
-            daily = data_binance_1h.resample("1D").agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Adj Close": "last",
-                "Volume": "sum"
-            }).dropna()
-            print(f"[DEBUG] Aggregated to {len(daily)} daily rows", file=sys.stderr)
-            if len(daily) >= min_days:
-                print(f"[DEBUG] Using 1h aggregated klines", file=sys.stderr)
-                return daily
-    except Exception as e:
-        print(f"[DEBUG] Error with 1h klines: {e}", file=sys.stderr)
-
-    print(f"[DEBUG] All fallbacks exhausted, raising error", file=sys.stderr)
-    raise ValueError(f"Unable to fetch data from Binance API. Please check your internet connection and try again.")
-
-# Get real-time current price (not cached)
+# Get real-time current price (not cached) - use CoinGecko
 def get_realtime_price(symbol):
-    """Fetch the current real-time price from Binance."""
+    """Fetch the current real-time price from CoinGecko."""
     try:
-        # Convert SOL-USD to SOLUSDT for Binance
-        url = "https://api.binance.com/api/v3/ticker/price"
-        params = {"symbol": "SOLUSDT"}
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": "solana",
+            "vs_currencies": "usd"
+        }
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        return float(data.get("price", 0))
+        price = data.get("solana", {}).get("usd")
+        if price:
+            return float(price)
     except Exception:
         pass
     return None
