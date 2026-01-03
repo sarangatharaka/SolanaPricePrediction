@@ -469,47 +469,54 @@ if st.sidebar.button("🗑️ Clear Model Cache"):
 st.title("💹Solana Price Prediction")
 st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 
-# Cache the data download
-@st.cache_data
-def download_data(symbol, start, end, min_days: int = SEQUENCE_LENGTH + 1):
-    """Download price history with multiple fallbacks (Yahoo then Binance) to avoid empty datasets."""
-
+# Download data without caching (simpler, more reliable for Streamlit deployment)
+def download_data(symbol, start, end):
+    """Download price history with multiple fallbacks (Yahoo then Binance)."""
+    min_days = SEQUENCE_LENGTH + 1
+    
     def _trim_to_range(df: pd.DataFrame):
         if df.empty:
             return df
         idx = df.index.tz_localize(None) if getattr(df.index, "tz", None) else df.index
         return df.loc[(idx.date >= start) & (idx.date <= end)]
 
-    def _pull_yf(symbol_value, start_value, end_value, **kwargs):
-        try:
-            df = yf.download(symbol_value, start=start_value, end=end_value, progress=False, **kwargs)
-            return df if df is not None else pd.DataFrame()
-        except Exception:
-            return pd.DataFrame()
+    def _pull_yf_with_retry(symbol_value, start_value=None, end_value=None, period=None, max_retries=3):
+        """Pull from Yahoo Finance with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                if period:
+                    df = yf.download(symbol_value, period=period, progress=False, timeout=15)
+                else:
+                    df = yf.download(symbol_value, start=start_value, end=end_value, progress=False, timeout=15)
+                if df is not None and not df.empty:
+                    return df.sort_index()
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1 + attempt)  # Progressive backoff: 1s, 2s, 3s
+                continue
+        return pd.DataFrame()
 
-    def _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200, start_value=None, end_value=None):
+    def _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200):
+        """Pull from Binance API."""
         try:
             url = "https://api.binance.com/api/v3/klines"
             params = {"symbol": symbol_value, "interval": interval, "limit": limit}
-            if start_value:
-                params["startTime"] = int(datetime.datetime.combine(start_value, datetime.time.min).timestamp() * 1000)
-            if end_value:
-                params["endTime"] = int(datetime.datetime.combine(end_value, datetime.time.max).timestamp() * 1000)
-            resp = requests.get(url, params=params, timeout=10)
+            resp = requests.get(url, params=params, timeout=15)
             resp.raise_for_status()
             klines = resp.json()
+            if not klines:
+                return pd.DataFrame()
             cols = [
                 "open_time", "open", "high", "low", "close", "volume", "close_time",
                 "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
             ]
             df = pd.DataFrame(klines, columns=cols)
-            if df.empty:
-                return df
             df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
             df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            df = df.set_index("close_time")
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.set_index("close_time").sort_index()
             df.rename(columns={
                 "open": "Open",
                 "high": "High",
@@ -517,37 +524,36 @@ def download_data(symbol, start, end, min_days: int = SEQUENCE_LENGTH + 1):
                 "close": "Close",
                 "volume": "Volume"
             }, inplace=True)
-            # Binance has no Adj Close; use Close
             df["Adj Close"] = df["Close"]
-            return df
+            return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
         except Exception:
             return pd.DataFrame()
 
-    end_extended = end + datetime.timedelta(days=1)  # grab the latest candle
+    end_extended = end + datetime.timedelta(days=1)
 
-    # 1) User-selected window
-    data = _pull_yf(symbol, start, end_extended).sort_index()
+    # 1) Try user-selected window first
+    data = _pull_yf_with_retry(symbol, start, end_extended)
     if len(data) >= min_days:
         return _trim_to_range(data)
 
-    # 2) Widened window on Yahoo
+    # 2) Widen the window automatically on Yahoo
     widened_start = max(start - datetime.timedelta(days=max(min_days * 2, 120)), datetime.date(2018, 1, 1))
-    data_wide = _pull_yf(symbol, widened_start, end_extended).sort_index()
+    data_wide = _pull_yf_with_retry(symbol, widened_start, end_extended)
     if len(data_wide) >= min_days:
         return _trim_to_range(data_wide)
 
     # 3) Max history on Yahoo
-    data_max = _pull_yf(symbol, None, None, period="max").sort_index()
+    data_max = _pull_yf_with_retry(symbol, period="max")
     if len(data_max) >= min_days:
         return _trim_to_range(data_max)
 
-    # 4) Binance daily candles fallback (SOLUSDT)
-    data_binance = _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200, start_value=start, end_value=end)
+    # 4) Binance daily candles (SOLUSDT)
+    data_binance = _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200)
     if len(data_binance) >= min_days:
         return _trim_to_range(data_binance)
 
-    # 5) Binance 4h candles aggregated to daily as last resort
-    data_binance_4h = _pull_binance(symbol_value="SOLUSDT", interval="4h", limit=1500, start_value=start, end_value=end)
+    # 5) Binance 4h candles aggregated to daily
+    data_binance_4h = _pull_binance(symbol_value="SOLUSDT", interval="4h", limit=1500)
     if not data_binance_4h.empty:
         daily = data_binance_4h.resample("1D").agg({
             "Open": "first",
@@ -560,7 +566,7 @@ def download_data(symbol, start, end, min_days: int = SEQUENCE_LENGTH + 1):
         if len(daily) >= min_days:
             return _trim_to_range(daily)
 
-    raise ValueError(f"Insufficient data returned for {symbol} (got 0 rows across all sources). Try expanding the date range or retry later.")
+    raise ValueError(f"Insufficient data for {symbol} (0 rows across all sources). Please try again or expand your date range.")
 
 # Get real-time current price (not cached)
 def get_realtime_price(symbol):
@@ -581,8 +587,8 @@ def get_realtime_price(symbol):
         pass
     return None
 
-# Cache feature engineering
-@st.cache_data
+# Cache feature engineering (use resource cache for this since it's less problematic)
+@st.cache_resource(show_spinner=False)
 def engineer_features(data, use_tech_indicators, use_vol):
     if use_tech_indicators:
         data = add_technical_indicators(data)
