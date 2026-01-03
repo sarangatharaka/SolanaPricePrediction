@@ -472,55 +472,34 @@ st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 # Download data without caching (use Binance as primary, avoid Yahoo Finance blocking)
 def download_data(symbol, start, end):
     """Download price history from Binance with fallbacks."""
+    import sys
     min_days = SEQUENCE_LENGTH + 1
-    
-    def _trim_to_range(df: pd.DataFrame):
-        if df.empty:
-            return df
-        idx = df.index.tz_localize(None) if getattr(df.index, "tz", None) else df.index
-        return df.loc[(idx.date >= start) & (idx.date <= end)]
 
-    def _pull_binance_paginated(symbol_value="SOLUSDT", interval="1d", days_back=1500):
-        """Pull from Binance API with pagination to get maximum history."""
+    def _pull_binance_simple(symbol_value="SOLUSDT", interval="1d", limit=1000):
+        """Simple pull from Binance API - single request, no pagination."""
         try:
-            import time
             url = "https://api.binance.com/api/v3/klines"
-            all_klines = []
-            start_time = None
+            params = {
+                "symbol": symbol_value,
+                "interval": interval,
+                "limit": limit
+            }
+            print(f"[DEBUG] Requesting {url} with params {params}", file=sys.stderr)
+            resp = requests.get(url, params=params, timeout=20)
+            print(f"[DEBUG] Response status: {resp.status_code}", file=sys.stderr)
+            resp.raise_for_status()
+            klines = resp.json()
+            print(f"[DEBUG] Got {len(klines)} klines", file=sys.stderr)
             
-            # Paginate backwards to get maximum history (Binance max 1000 per request)
-            for page in range(max(days_back // 1000 + 1, 3)):
-                params = {
-                    "symbol": symbol_value,
-                    "interval": interval,
-                    "limit": 1000
-                }
-                if start_time is not None:
-                    params["endTime"] = start_time - 1
-                
-                resp = requests.get(url, params=params, timeout=15)
-                resp.raise_for_status()
-                klines = resp.json()
-                
-                if not klines:
-                    break
-                
-                all_klines = klines + all_klines  # prepend to maintain chronological order
-                start_time = int(klines[0][0])  # Set next end_time to first candle's open_time
-                
-                if len(all_klines) >= days_back:
-                    break
-                    
-                time.sleep(0.1)  # Respectful rate limiting
-            
-            if not all_klines:
+            if not klines or len(klines) == 0:
+                print(f"[DEBUG] Empty klines response", file=sys.stderr)
                 return pd.DataFrame()
             
             cols = [
                 "open_time", "open", "high", "low", "close", "volume", "close_time",
                 "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
             ]
-            df = pd.DataFrame(all_klines, columns=cols)
+            df = pd.DataFrame(klines, columns=cols)
             df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
             df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
             for col in ["open", "high", "low", "close", "volume"]:
@@ -534,19 +513,29 @@ def download_data(symbol, start, end):
                 "volume": "Volume"
             }, inplace=True)
             df["Adj Close"] = df["Close"]
-            return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna()
+            result = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna()
+            print(f"[DEBUG] Returning {len(result)} rows", file=sys.stderr)
+            return result
         except Exception as e:
+            print(f"[DEBUG] Error in _pull_binance_simple: {type(e).__name__}: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return pd.DataFrame()
 
-    # PRIMARY: Binance daily candles (SOLUSDT) - paginated for maximum history
-    data_binance_daily = _pull_binance_paginated(symbol_value="SOLUSDT", interval="1d", days_back=1500)
+    # PRIMARY: Binance daily candles (SOLUSDT) - 1000 candles = ~3 years
+    print(f"[DEBUG] Attempting to fetch daily klines", file=sys.stderr)
+    data_binance_daily = _pull_binance_simple(symbol_value="SOLUSDT", interval="1d", limit=1000)
+    print(f"[DEBUG] Daily klines result: {len(data_binance_daily)} rows", file=sys.stderr)
     if len(data_binance_daily) >= min_days:
-        return _trim_to_range(data_binance_daily)
+        print(f"[DEBUG] Using daily klines", file=sys.stderr)
+        return data_binance_daily
 
-    # FALLBACK: Binance 4h candles aggregated to daily
+    # FALLBACK: Binance 4h candles (1000 candles = ~166 days) - aggregate to daily
+    print(f"[DEBUG] Attempting to fetch 4h klines", file=sys.stderr)
     try:
-        data_binance_4h = _pull_binance_paginated(symbol_value="SOLUSDT", interval="4h", days_back=2000)
-        if not data_binance_4h.empty:
+        data_binance_4h = _pull_binance_simple(symbol_value="SOLUSDT", interval="4h", limit=1000)
+        print(f"[DEBUG] 4h klines result: {len(data_binance_4h)} rows", file=sys.stderr)
+        if not data_binance_4h.empty and len(data_binance_4h) >= min_days:
             daily = data_binance_4h.resample("1D").agg({
                 "Open": "first",
                 "High": "max",
@@ -555,12 +544,36 @@ def download_data(symbol, start, end):
                 "Adj Close": "last",
                 "Volume": "sum"
             }).dropna()
+            print(f"[DEBUG] Aggregated to {len(daily)} daily rows", file=sys.stderr)
             if len(daily) >= min_days:
-                return _trim_to_range(daily)
-    except Exception:
-        pass
+                print(f"[DEBUG] Using 4h aggregated klines", file=sys.stderr)
+                return daily
+    except Exception as e:
+        print(f"[DEBUG] Error with 4h klines: {e}", file=sys.stderr)
 
-    raise ValueError(f"Insufficient data for {symbol} (0 rows from Binance). Check your internet connection and try again.")
+    # LAST RESORT: Use 1h candles (1000 candles = ~41 days) aggregated to daily
+    print(f"[DEBUG] Attempting to fetch 1h klines", file=sys.stderr)
+    try:
+        data_binance_1h = _pull_binance_simple(symbol_value="SOLUSDT", interval="1h", limit=1000)
+        print(f"[DEBUG] 1h klines result: {len(data_binance_1h)} rows", file=sys.stderr)
+        if not data_binance_1h.empty and len(data_binance_1h) >= min_days:
+            daily = data_binance_1h.resample("1D").agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Adj Close": "last",
+                "Volume": "sum"
+            }).dropna()
+            print(f"[DEBUG] Aggregated to {len(daily)} daily rows", file=sys.stderr)
+            if len(daily) >= min_days:
+                print(f"[DEBUG] Using 1h aggregated klines", file=sys.stderr)
+                return daily
+    except Exception as e:
+        print(f"[DEBUG] Error with 1h klines: {e}", file=sys.stderr)
+
+    print(f"[DEBUG] All fallbacks exhausted, raising error", file=sys.stderr)
+    raise ValueError(f"Unable to fetch data from Binance API. Please check your internet connection and try again.")
 
 # Get real-time current price (not cached)
 def get_realtime_price(symbol):
