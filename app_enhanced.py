@@ -469,9 +469,9 @@ if st.sidebar.button("🗑️ Clear Model Cache"):
 st.title("💹Solana Price Prediction")
 st.markdown("*Advanced LSTM/GRU/Transformer Models with Technical Indicators*")
 
-# Download data without caching (simpler, more reliable for Streamlit deployment)
+# Download data without caching (use Binance as primary, avoid Yahoo Finance blocking)
 def download_data(symbol, start, end):
-    """Download price history with multiple fallbacks (Yahoo then Binance)."""
+    """Download price history from Binance with fallbacks."""
     min_days = SEQUENCE_LENGTH + 1
     
     def _trim_to_range(df: pd.DataFrame):
@@ -480,38 +480,47 @@ def download_data(symbol, start, end):
         idx = df.index.tz_localize(None) if getattr(df.index, "tz", None) else df.index
         return df.loc[(idx.date >= start) & (idx.date <= end)]
 
-    def _pull_yf_with_retry(symbol_value, start_value=None, end_value=None, period=None, max_retries=3):
-        """Pull from Yahoo Finance with retry logic."""
-        for attempt in range(max_retries):
-            try:
-                if period:
-                    df = yf.download(symbol_value, period=period, progress=False, timeout=15)
-                else:
-                    df = yf.download(symbol_value, start=start_value, end=end_value, progress=False, timeout=15)
-                if df is not None and not df.empty:
-                    return df.sort_index()
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    import time
-                    time.sleep(1 + attempt)  # Progressive backoff: 1s, 2s, 3s
-                continue
-        return pd.DataFrame()
-
-    def _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200):
-        """Pull from Binance API."""
+    def _pull_binance_paginated(symbol_value="SOLUSDT", interval="1d", days_back=1500):
+        """Pull from Binance API with pagination to get maximum history."""
         try:
+            import time
             url = "https://api.binance.com/api/v3/klines"
-            params = {"symbol": symbol_value, "interval": interval, "limit": limit}
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            klines = resp.json()
-            if not klines:
+            all_klines = []
+            start_time = None
+            
+            # Paginate backwards to get maximum history (Binance max 1000 per request)
+            for page in range(max(days_back // 1000 + 1, 3)):
+                params = {
+                    "symbol": symbol_value,
+                    "interval": interval,
+                    "limit": 1000
+                }
+                if start_time is not None:
+                    params["endTime"] = start_time - 1
+                
+                resp = requests.get(url, params=params, timeout=15)
+                resp.raise_for_status()
+                klines = resp.json()
+                
+                if not klines:
+                    break
+                
+                all_klines = klines + all_klines  # prepend to maintain chronological order
+                start_time = int(klines[0][0])  # Set next end_time to first candle's open_time
+                
+                if len(all_klines) >= days_back:
+                    break
+                    
+                time.sleep(0.1)  # Respectful rate limiting
+            
+            if not all_klines:
                 return pd.DataFrame()
+            
             cols = [
                 "open_time", "open", "high", "low", "close", "volume", "close_time",
                 "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote", "ignore"
             ]
-            df = pd.DataFrame(klines, columns=cols)
+            df = pd.DataFrame(all_klines, columns=cols)
             df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
             df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
             for col in ["open", "high", "low", "close", "volume"]:
@@ -525,65 +534,46 @@ def download_data(symbol, start, end):
                 "volume": "Volume"
             }, inplace=True)
             df["Adj Close"] = df["Close"]
-            return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
-        except Exception:
+            return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].dropna()
+        except Exception as e:
             return pd.DataFrame()
 
-    end_extended = end + datetime.timedelta(days=1)
+    # PRIMARY: Binance daily candles (SOLUSDT) - paginated for maximum history
+    data_binance_daily = _pull_binance_paginated(symbol_value="SOLUSDT", interval="1d", days_back=1500)
+    if len(data_binance_daily) >= min_days:
+        return _trim_to_range(data_binance_daily)
 
-    # 1) Try user-selected window first
-    data = _pull_yf_with_retry(symbol, start, end_extended)
-    if len(data) >= min_days:
-        return _trim_to_range(data)
+    # FALLBACK: Binance 4h candles aggregated to daily
+    try:
+        data_binance_4h = _pull_binance_paginated(symbol_value="SOLUSDT", interval="4h", days_back=2000)
+        if not data_binance_4h.empty:
+            daily = data_binance_4h.resample("1D").agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Adj Close": "last",
+                "Volume": "sum"
+            }).dropna()
+            if len(daily) >= min_days:
+                return _trim_to_range(daily)
+    except Exception:
+        pass
 
-    # 2) Widen the window automatically on Yahoo
-    widened_start = max(start - datetime.timedelta(days=max(min_days * 2, 120)), datetime.date(2018, 1, 1))
-    data_wide = _pull_yf_with_retry(symbol, widened_start, end_extended)
-    if len(data_wide) >= min_days:
-        return _trim_to_range(data_wide)
-
-    # 3) Max history on Yahoo
-    data_max = _pull_yf_with_retry(symbol, period="max")
-    if len(data_max) >= min_days:
-        return _trim_to_range(data_max)
-
-    # 4) Binance daily candles (SOLUSDT)
-    data_binance = _pull_binance(symbol_value="SOLUSDT", interval="1d", limit=1200)
-    if len(data_binance) >= min_days:
-        return _trim_to_range(data_binance)
-
-    # 5) Binance 4h candles aggregated to daily
-    data_binance_4h = _pull_binance(symbol_value="SOLUSDT", interval="4h", limit=1500)
-    if not data_binance_4h.empty:
-        daily = data_binance_4h.resample("1D").agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Adj Close": "last",
-            "Volume": "sum"
-        }).dropna()
-        if len(daily) >= min_days:
-            return _trim_to_range(daily)
-
-    raise ValueError(f"Insufficient data for {symbol} (0 rows across all sources). Please try again or expand your date range.")
+    raise ValueError(f"Insufficient data for {symbol} (0 rows from Binance). Check your internet connection and try again.")
 
 # Get real-time current price (not cached)
 def get_realtime_price(symbol):
-    """Fetch the current real-time price"""
+    """Fetch the current real-time price from Binance."""
     try:
-        ticker = yf.Ticker(symbol)
-        # Try to get the current price from ticker info
-        info = ticker.info
-        if 'currentPrice' in info and info['currentPrice']:
-            return info['currentPrice']
-        elif 'regularMarketPrice' in info and info['regularMarketPrice']:
-            return info['regularMarketPrice']
-        # Fallback: get the latest price from history
-        hist = ticker.history(period='1d')
-        if not hist.empty:
-            return float(hist['Close'].iloc[-1])
-    except:
+        # Convert SOL-USD to SOLUSDT for Binance
+        url = "https://api.binance.com/api/v3/ticker/price"
+        params = {"symbol": "SOLUSDT"}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return float(data.get("price", 0))
+    except Exception:
         pass
     return None
 
